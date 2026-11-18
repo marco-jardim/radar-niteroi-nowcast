@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Preditor de Chuva - Radar Niterói
 // @namespace    https://radar.niteroi.rj.gov.br/
-// @version      2.1.1
+// @version      2.2.0
 // @description  Prevê quando a chuva chega, quanto dura e quanto chove num ponto escolhido, a partir do radar meteorológico de Niterói
 // @author       marco-jardim
 // @homepageURL  https://github.com/marco-jardim/radar-niteroi-nowcast
@@ -11,7 +11,11 @@
 // @license      MIT
 // @match        https://radar.niteroi.rj.gov.br/*
 // @icon         https://radar.niteroi.rj.gov.br/assets/logo.c4021fe7.png
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
+// @connect      sirene.cbmerj.rj.gov.br
+// @connect      websempre.rio.rj.gov.br
+// @connect      services8.arcgis.com
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -19,13 +23,15 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.1.1';
+  const VERSION = '2.2.0';
   const LOG = '[Preditor de Chuva]';
+  // com @grant o script roda em sandbox: globais da página (L, instância, API) vivem em unsafeWindow
+  const PAGE = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   // ── Instância única ──────────────────────────────────────────────
-  if (window.__rp2Instance && typeof window.__rp2Instance.destroy === 'function') {
+  if (PAGE.__rp2Instance && typeof PAGE.__rp2Instance.destroy === 'function') {
     try {
-      window.__rp2Instance.destroy();
+      PAGE.__rp2Instance.destroy();
     } catch (err) {
       console.error(LOG, err);
     }
@@ -38,7 +44,10 @@
   const DS = 4; // fator de redução da imagem
   const STEP = 5; // minutos entre passos da previsão
   const NFRAMES = 7;
-  const CACHE_MAX = 16;
+  const CACHE_MAX = 24;
+  const CALIB_FRAMES = 20; // quadros recentes carregados para calibrar com pluviômetros
+  const GAUGE_POLL_MS = 5 * 60000;
+  const GAUGE_MAX_AGE_MS = 90 * 60000;
   const POLL_MS = 60000;
   const TICK_MS = 30000;
   const DEFAULT_TARGET = { lat: -22.9033, lon: -43.1089, name: 'Icaraí, Niterói' };
@@ -56,7 +65,7 @@
     minChance: [30, 50, 70],
     thr: [15, 20, 25],
   };
-  const DEFAULTS = { v: 1, horizon: 120, lead: 30, minChance: 50, thr: 20, alerts: false, showMap: true };
+  const DEFAULTS = { v: 1, horizon: 120, lead: 30, minChance: 50, thr: 20, alerts: false, showMap: true, showGauges: true };
 
   // ── Utilitários ──────────────────────────────────────────────────
   const esc = (s) =>
@@ -124,6 +133,7 @@
       });
       if (typeof raw.alerts === 'boolean') s.alerts = raw.alerts;
       if (typeof raw.showMap === 'boolean') s.showMap = raw.showMap;
+      if (typeof raw.showGauges === 'boolean') s.showGauges = raw.showGauges;
     }
     return s;
   }
@@ -173,6 +183,15 @@
     timings: {},
     skill: null,
     skillKey: null,
+    skillRun: null,
+    gauges: [],
+    gaugesAt: null,
+    gaugeStatus: {},
+    gaugePromise: null,
+    gaugeLayer: null,
+    calibKey: null,
+    calibState: { logB: 0, at: Date.now() },
+    calib: { mfb: 1, targetFactor: 1, nPairs: 0, nLocal: 0, sumG: 0, sumR: 0, at: null, valid: false },
   };
   const skillKey = (productId, thr) => productId + ':' + thr;
   const uiState = loadUiState();
@@ -217,6 +236,418 @@
       throw e;
     }
     return body;
+  }
+
+  // ── Pluviômetros: acesso, normalização e atualização ─────────────
+  const SIRENE_URL = 'https://sirene.cbmerj.rj.gov.br:8443/sirenesestadorj/MapaControle?cmd=';
+  const ALERTA_RIO_URL = 'https://websempre.rio.rj.gov.br/json/chuvas';
+  const AGOL_URL =
+    'https://services8.arcgis.com/TpaOLI1HCh5AcRQB/arcgis/rest/services/Grouplayer_SVIDA_SMDCG/FeatureServer/15/query?where=1%3D1&outFields=*&returnGeometry=false&f=json';
+  const SRC_NITEROI = 'Defesa Civil Niterói';
+  const GAUGE_BOX = { latMin: -24.5, latMax: -20, lonMin: -45.5, lonMax: -40.5 }; // margem folgada sobre o estado do RJ
+
+  const hostOf = (url) => {
+    const m = /^https?:\/\/([^/]+)/i.exec(String(url));
+    return m ? m[1] : String(url);
+  };
+
+  // fetch simples com tempo limite (fallback do gmGet e fonte ArcGIS, que tem CORS)
+  function fetchText(url, timeoutMs) {
+    const host = hostOf(url);
+    const ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : null;
+    return fetch(url, ctl ? { signal: ctl.signal } : undefined)
+      .then((r) => {
+        if (!r.ok) throw new Error('HTTP ' + r.status + ' em ' + host);
+        return r.text();
+      })
+      .catch((err) => {
+        if (err && err.name === 'AbortError') throw new Error('Tempo esgotado ao acessar ' + host);
+        if (err instanceof TypeError) throw new Error('Falha de rede ao acessar ' + host);
+        throw err;
+      })
+      .finally(() => clearTimeout(timer));
+  }
+
+  // GET sem CORS via extensão; cai para fetch quando GM_xmlhttpRequest não existe
+  function gmGet(url, timeoutMs = 20000) {
+    if (typeof GM_xmlhttpRequest !== 'function') return fetchText(url, timeoutMs);
+    const host = hostOf(url);
+    return new Promise((resolve, reject) => {
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url,
+          timeout: timeoutMs,
+          anonymous: true,
+          headers: { Accept: 'application/json, text/plain, */*' },
+          overrideMimeType: 'text/plain; charset=utf-8',
+          onload: (r) => {
+            if (r.status >= 200 && r.status < 300) resolve(String(r.responseText == null ? '' : r.responseText));
+            else reject(new Error('HTTP ' + r.status + ' em ' + host));
+          },
+          onerror: () => reject(new Error('Falha de rede ao acessar ' + host)),
+          ontimeout: () => reject(new Error('Tempo esgotado ao acessar ' + host)),
+          onabort: () => reject(new Error('Requisição abortada para ' + host)),
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  function parseJson(text) {
+    try {
+      return JSON.parse(String(text).replace(/^\uFEFF/, ''));
+    } catch (err) {
+      const e = new Error('Resposta inválida (JSON malformado)');
+      e.cause = err;
+      throw e;
+    }
+  }
+
+  function toNum(x) {
+    if (x == null || x === '') return null;
+    const n = typeof x === 'number' ? x : Number(String(x).trim().replace(',', '.'));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // "dd/MM/yyyy HH:mm[:ss]" em horário de Brasília (UTC−3), independente do fuso do navegador; ISO com offset via Date.parse
+  function parseStamp(s) {
+    if (typeof s !== 'string') return NaN;
+    const str = s.trim();
+    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(str);
+    if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1], +m[4] + 3, +m[5], m[6] ? +m[6] : 0);
+    if (/^\d{4}-\d{2}-\d{2}T/.test(str)) return Date.parse(str);
+    return NaN;
+  }
+
+  const objsOf = (arr) => {
+    if (!Array.isArray(arr)) throw new Error('Resposta inesperada (esperava uma lista)');
+    return arr.filter((r) => r && typeof r === 'object');
+  };
+
+  const rawGauge = (source, nid, name, city, lat, lon, t, mm15, mm1h, mm24h, off) => ({
+    id: source + ':' + nid,
+    name: String(name == null || String(name).trim() === '' ? nid : name).trim(),
+    source,
+    city: city == null ? '' : String(city).trim(),
+    lat, lon, t, mm15, mm1h, mm24h, off: !!off,
+  });
+
+  function normNiteroi(data) {
+    return objsOf(data).map((r) =>
+      rawGauge(SRC_NITEROI, r.codEstacao != null ? r.codEstacao : r.idPluviometro, r.nomeEstacao, 'Niterói', toNum(r.latitude), toNum(r.longitude),
+        parseStamp(r.dataHora), toNum(r.tempo15m), toNum(r.tempo1h), toNum(r.tempo24h), r.flagOffLine == 1)
+    );
+  }
+
+  function normAgol(data) {
+    const feats = data && Array.isArray(data.features) ? data.features : null;
+    if (!feats) throw new Error('Resposta inesperada do ArcGIS');
+    return feats
+      .map((f) => f && f.attributes)
+      .filter((a) => a && typeof a === 'object')
+      .map((a) => rawGauge(SRC_NITEROI, a.tx_estacao, a.tx_estacao, 'Niterói', toNum(a.fl_lat), toNum(a.fl_lon), parseStamp(a.dt_data), null, toNum(a.fl_pp1h), toNum(a.fl_pp24h), false));
+  }
+
+  function normEstado(data) {
+    return objsOf(data)
+      .filter((r) => r.equipamento && /pluvi/i.test(String(r.equipamento.tipoEquipamento || '')) && r.pluviometro && typeof r.pluviometro === 'object')
+      .map((r) =>
+        rawGauge('Defesa Civil RJ', r.idEstacao, r.nomeEstacao, r.cidade, toNum(r.latitude), toNum(r.longitude), parseStamp(r.pluviometro.DataHora),
+          toNum(r.pluviometro.tempo1), toNum(r.pluviometro.tempo2), null, r.pluviometro.flagOffLine == 1)
+      );
+  }
+
+  function normCemaden(data) {
+    return objsOf(data)
+      .filter((r) => r.pluviometro && typeof r.pluviometro === 'object')
+      .map((r) =>
+        rawGauge('CEMADEN', r.nomeEstacao, r.descricaoEstacao, r.cidade, toNum(r.latitude), toNum(r.longitude), parseStamp(r.pluviometro.DataHora),
+          null, toNum(r.pluviometro.tempo2), null, r.pluviometro.flagOffLine == 1)
+      );
+  }
+
+  function normInea(data) {
+    return objsOf(data).map((r) =>
+      rawGauge('INEA', r.nomeEstacao, r.nomeEstacao, r.municipio, toNum(r.latitude), toNum(r.longitude), parseStamp(r.dataHora), null, toNum(r.chuva_1H), toNum(r.chuva_24H), r.flagOffLine == 1)
+    );
+  }
+
+  // primeira lista de objetos com `location` (raiz ou aninhada)
+  function findGaugeArray(node, depth) {
+    if (Array.isArray(node)) {
+      if (node.some((e) => e && typeof e === 'object' && e.location)) return node;
+      return null;
+    }
+    if (node && typeof node === 'object' && depth < 3) {
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i++) {
+        const found = findGaugeArray(node[keys[i]], depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  function normAlertaRio(data) {
+    const arr = findGaugeArray(data, 0);
+    if (!arr) throw new Error('Lista de estações não encontrada');
+    return objsOf(arr)
+      .filter((r) => Array.isArray(r.location) && (r.kind == null || /pluvi/i.test(String(r.kind))))
+      .map((r) => {
+        const d = r.data && typeof r.data === 'object' ? r.data : {};
+        return rawGauge('Alerta Rio', r.name, r.name, 'Rio de Janeiro', toNum(r.location[0]), toNum(r.location[1]), parseStamp(r.read_at), toNum(d.m15), toNum(d.h01), toNum(d.h24), false);
+      });
+  }
+
+  // aplica os filtros de qualidade e devolve o modelo público
+  function keepGauges(raw, now) {
+    const out = [];
+    raw.forEach((r) => {
+      if (r.off) return;
+      if (!Number.isFinite(r.lat) || !Number.isFinite(r.lon)) return;
+      if (r.lat < GAUGE_BOX.latMin || r.lat > GAUGE_BOX.latMax || r.lon < GAUGE_BOX.lonMin || r.lon > GAUGE_BOX.lonMax) return;
+      if (!Number.isFinite(r.mm1h) || r.mm1h < 0) return;
+      if (!Number.isFinite(r.t) || now - r.t > GAUGE_MAX_AGE_MS) return;
+      out.push({
+        id: r.id,
+        name: r.name,
+        source: r.source,
+        city: r.city,
+        lat: r.lat,
+        lon: r.lon,
+        t: r.t,
+        mm15: Number.isFinite(r.mm15) && r.mm15 >= 0 ? r.mm15 : null,
+        mm1h: r.mm1h,
+        mm24h: Number.isFinite(r.mm24h) && r.mm24h >= 0 ? r.mm24h : null,
+        radar1h: null,
+      });
+    });
+    return out;
+  }
+
+  async function loadNiteroi(now, status) {
+    try {
+      return keepGauges(normNiteroi(parseJson(await gmGet(SIRENE_URL + 'consultaEstacoesNiteroiAtualiza'))), now);
+    } catch (err) {
+      console.error(LOG, 'Niterói: fonte principal falhou; tentando ArcGIS', err);
+      try {
+        const list = keepGauges(normAgol(parseJson(await fetchText(AGOL_URL, 20000))), now);
+        status.fallback = true;
+        return list;
+      } catch (err2) {
+        throw new Error(err.message + ' | ArcGIS: ' + err2.message);
+      }
+    }
+  }
+
+  const sireneSource = (key, label, cmd, norm) => ({
+    key,
+    label,
+    load: async (now) => keepGauges(norm(parseJson(await gmGet(SIRENE_URL + cmd))), now),
+  });
+
+  const GAUGE_SOURCES = [
+    { key: 'niteroi', label: SRC_NITEROI, load: loadNiteroi },
+    sireneSource('estado', 'Defesa Civil RJ', 'consultaEstacoesAtualiza', normEstado),
+    sireneSource('cemaden', 'CEMADEN', 'consultaEstacoesCemadenAtualiza', normCemaden),
+    sireneSource('inea', 'INEA', 'consultaEstacoesIneaAtualiza', normInea),
+    { key: 'alertario', label: 'Alerta Rio', load: async (now) => keepGauges(normAlertaRio(parseJson(await gmGet(ALERTA_RIO_URL))), now) },
+  ];
+
+  // pluviômetros de fontes diferentes a menos de 150 m: fica o de leitura mais recente
+  function dedupeGauges(list) {
+    const kept = [];
+    list
+      .slice()
+      .sort((a, b) => b.t - a.t)
+      .forEach((g) => {
+        const dup = kept.some(
+          (k) => k.source !== g.source && Math.abs(k.lat - g.lat) < 0.002 && Math.abs(k.lon - g.lon) < 0.002 && haversine(k.lat, k.lon, g.lat, g.lon) < 0.15
+        );
+        if (!dup) kept.push(g);
+      });
+    return kept;
+  }
+
+  async function doFetchGauges() {
+    const now = Date.now();
+    const statuses = {};
+    const results = await Promise.allSettled(
+      GAUGE_SOURCES.map((s) => {
+        statuses[s.key] = { label: s.label, ok: false, count: 0, error: null, at: now };
+        return s.load(now, statuses[s.key]);
+      })
+    );
+    const all = [];
+    let anyOk = false;
+    results.forEach((r, i) => {
+      const s = GAUGE_SOURCES[i];
+      const st = statuses[s.key];
+      if (r.status === 'fulfilled') {
+        anyOk = true;
+        st.ok = true;
+        st.count = r.value.length;
+        r.value.forEach((g) => all.push(g));
+      } else {
+        st.error = r.reason && r.reason.message ? r.reason.message : String(r.reason);
+        console.error(LOG, 'Pluviômetros (' + s.label + ') indisponíveis', r.reason);
+        // falha transitória: mantém as últimas leituras ainda dentro do limite de idade
+        const keep = state.gauges.filter((g) => g.source === s.label && now - g.t <= GAUGE_MAX_AGE_MS);
+        st.count = keep.length;
+        keep.forEach((g) => all.push(g));
+      }
+    });
+    if (state.destroyed) return;
+    state.gaugeStatus = statuses;
+    state.gauges = dedupeGauges(all);
+    if (anyOk) state.gaugesAt = now;
+  }
+
+  function fetchGauges() {
+    if (state.gaugePromise) return state.gaugePromise;
+    state.gaugePromise = doFetchGauges().finally(() => {
+      state.gaugePromise = null;
+    });
+    return state.gaugePromise;
+  }
+
+  // ── Calibração do radar com pluviômetros ─────────────────────────
+  const B_MIN = 0.25;
+  const B_MAX = 4;
+
+  // taxa (mm/h) média nas 3×3 células em torno de (gx, gy); dBZ 0 = sem eco
+  function cellRate(grid, geom, gx, gy) {
+    let s = 0;
+    let n = 0;
+    for (let y = gy - 1; y <= gy + 1; y++) {
+      if (y < 0 || y >= geom.gh) continue;
+      for (let x = gx - 1; x <= gx + 1; x++) {
+        if (x < 0 || x >= geom.gw) continue;
+        n++;
+        const d = grid[y * geom.gw + x];
+        if (d > 0) s += rateOf(d);
+      }
+    }
+    return n ? s / n : 0;
+  }
+
+  // chuva do radar acumulada em (t_g − 60 min, t_g] sobre cada pluviômetro dentro da cobertura
+  function computeRadarAtGauges() {
+    const disc = state.disc;
+    state.gauges.forEach((g) => {
+      g.radar1h = null;
+    });
+    if (!disc || !disc.geom || !state.gauges.length) return;
+    const geom = disc.geom;
+    const frames = Array.from(state.frameCache.values())
+      .filter((f) => f.geom === geom)
+      .sort((a, b) => a.t - b.t);
+    if (!frames.length) return;
+    state.gauges.forEach((g) => {
+      if (haversine(g.lat, g.lon, disc.lat0, disc.lon0) > disc.radiusKm - 2) return;
+      const p = geom.geoToGrid(g.lat, g.lon);
+      const gx = Math.round(p.x);
+      const gy = Math.round(p.y);
+      if (gx < 0 || gy < 0 || gx >= geom.gw || gy >= geom.gh) return;
+      const lo = g.t - 60 * 60000;
+      let sum = 0;
+      let n = 0;
+      frames.forEach((f) => {
+        if (f.t > lo && f.t <= g.t) {
+          sum += (cellRate(f.grid, geom, gx, gy) * STEP) / 60;
+          n++;
+        }
+      });
+      if (n >= 10) g.radar1h = sum;
+    });
+  }
+
+  // fator do ponto: correção local (IDW em log) encolhida em direção ao viés médio
+  function targetCalib(target) {
+    const logB = state.calibState.logB;
+    let sw = 0;
+    let sw2 = 0;
+    let sr = 0;
+    let n = 0;
+    state.gauges.forEach((g) => {
+      if (g.radar1h == null || !(g.mm1h >= 0.5 || g.radar1h >= 0.5)) return;
+      const d = haversine(target.lat, target.lon, g.lat, g.lon);
+      if (d > 25) return;
+      const w = 1 / Math.pow(Math.max(d, 1), 2);
+      sw += w;
+      sw2 += w * w;
+      sr += w * Math.log((g.mm1h + 0.5) / (g.radar1h + 0.5));
+      n++;
+    });
+    let lb = logB;
+    if (n) {
+      const nEff = (sw * sw) / sw2;
+      const lam = nEff / (nEff + 3);
+      lb = lam * (sr / sw) + (1 - lam) * logB;
+    }
+    return { factor: Math.exp(clamp(lb, Math.log(B_MIN), Math.log(B_MAX))), nLocal: n };
+  }
+
+  function applyTargetCalib(target) {
+    const tc = targetCalib(target);
+    state.calib.targetFactor = tc.factor;
+    state.calib.nLocal = tc.nLocal;
+    return tc;
+  }
+
+  // recalcula radar×pluviômetro e o viés; devolve true se o fator aplicado no resultado atual mudou
+  function calibrate() {
+    try {
+      computeRadarAtGauges();
+      const now = Date.now();
+      const cs = state.calibState;
+      let sumG = 0;
+      let sumR = 0;
+      let nPairs = 0;
+      state.gauges.forEach((g) => {
+        if (g.radar1h == null || !(g.mm1h >= 0.2 || g.radar1h >= 0.2)) return;
+        nPairs++;
+        sumG += g.mm1h;
+        sumR += g.radar1h;
+      });
+      const valid = nPairs >= 3 && sumG >= 2 && sumR >= 2;
+      if (valid) {
+        const bNew = clamp(sumG / sumR, B_MIN, B_MAX);
+        cs.logB = 0.5 * Math.log(bNew) + 0.5 * cs.logB;
+      } else {
+        cs.logB *= Math.pow(0.5, (now - cs.at) / (60 * 60000)); // meia-vida de 60 min rumo à calibração neutra
+      }
+      cs.at = now;
+      Object.assign(state.calib, { mfb: Math.exp(cs.logB), nPairs, sumG, sumR, at: now, valid });
+      const tc = applyTargetCalib(state.target);
+      const applied = state.result && state.result.calib ? state.result.calib.factor : null;
+      return applied != null && Math.abs(Math.log(tc.factor / applied)) > 0.01;
+    } catch (err) {
+      console.error(LOG, 'Falha na calibração com pluviômetros', err);
+      return false;
+    }
+  }
+
+  // após novos pluviômetros ou novos quadros de calibração
+  function onCalibInputs() {
+    if (state.destroyed) return;
+    const changed = calibrate();
+    updateGaugeLayer();
+    render();
+    if (changed) run({ local: true });
+  }
+
+  async function refreshGauges() {
+    try {
+      await fetchGauges();
+    } catch (err) {
+      console.error(LOG, 'Falha ao atualizar pluviômetros', err);
+      return;
+    }
+    onCalibInputs();
   }
 
   // ── Descoberta (radar, tipo de produto, paleta) ──────────────────
@@ -825,6 +1256,15 @@
     let sig = hasMotion ? motion.sigmaKmMin : anyRain ? 15 / 60 : 2 / 60;
     if (skillPenalty) sig = Math.max(sig, motion.speedKmh / 60 / 2);
     const steps = nowcast(g, geom, tg, v, sig, thr, horizon);
+    // calibração com pluviômetros: só escala as taxas; a detecção (p) não muda
+    const tc = applyTargetCalib(target);
+    if (tc.factor !== 1) {
+      steps.forEach((s) => {
+        s.meanR *= tc.factor;
+        s.wetR *= tc.factor;
+        s.p90R *= tc.factor;
+      });
+    }
     timings.nowcast = Math.round(performance.now() - t0);
 
     // derivados
@@ -946,6 +1386,7 @@
       confidence,
       skill: skillScored ? { csiAdv: sk.csiAdv, csiPers: sk.csiPers, motionKmh: sk.motionKmh, at: sk.at, loses: skillLoses } : null,
       skillPenalty,
+      calib: { factor: tc.factor, nLocal: tc.nLocal, nPairs: state.calib.nPairs, mfb: state.calib.mfb, valid: state.calib.valid },
       outOfRangeFrom: firstOut ? firstOut.t : null,
       clutterCells,
       timings,
@@ -997,12 +1438,35 @@
     if (R.anyRain && R.motion.valid === 0) view.notes.push('Movimento não detectado — previsão pouco confiável');
     else if (R.motion.unreliable) view.notes.push('Movimento instável — previsão pouco confiável');
     if (R.skill && R.skill.loses) view.notes.push('Chuva se formando/mudando de ritmo — deslocamento pouco previsível agora');
+    groundTruthNotes(R, now).forEach((n) => view.notes.push(n));
     return view;
+  }
+
+  // confronto do radar com pluviômetros a ≤ 3 km do ponto (leituras de até 30 min); só avisa, não altera a previsão
+  function groundTruthNotes(R, now) {
+    if (!state.gauges.length) return [];
+    const near = state.gauges.filter((g) => now - g.t <= 30 * 60000 && haversine(R.target.lat, R.target.lon, g.lat, g.lon) <= 3);
+    if (!near.length) return [];
+    if (!R.rainingNow) {
+      let obs = -Infinity;
+      let unit = '15 min';
+      near.forEach((g) => {
+        const v = g.mm15 != null ? g.mm15 : g.mm1h;
+        if (v > obs) {
+          obs = v;
+          unit = g.mm15 != null ? '15 min' : '1h';
+        }
+      });
+      if (obs >= 0.2) return ['Pluviômetro próximo registrou chuva (' + num(obs, 1) + ' mm/' + unit + ')'];
+    } else if (near.every((g) => g.mm15 === 0)) {
+      return ['Pluviômetros próximos sem chuva nos últimos 15 min'];
+    }
+    return [];
   }
 
   // ── Mapa Leaflet (captura da instância) ──────────────────────────
   function captureMap() {
-    const L = window.L;
+    const L = PAGE.L;
     const cont = document.querySelector('.leaflet-container');
     if (!L || !L.Map || !cont) return null;
     const orig = L.Map.prototype._fireDOMEvent;
@@ -1047,7 +1511,7 @@
   function updateOverlay() {
     clearOverlay();
     const R = state.result;
-    if (state.destroyed || !settings.showMap || !R || state.error || !window.L) {
+    if (state.destroyed || !settings.showMap || !R || state.error || !PAGE.L) {
       renderButtons();
       return;
     }
@@ -1055,7 +1519,7 @@
     renderButtons();
     if (!map) return;
     try {
-      const L = window.L;
+      const L = PAGE.L;
       const geom = state.disc.geom;
       const layer = L.layerGroup();
       const tl = [R.target.lat, R.target.lon];
@@ -1080,6 +1544,55 @@
       }
       layer.addTo(map);
       state.layer = layer;
+      raiseTrajectory();
+    } catch (err) {
+      console.error(LOG, err);
+    }
+  }
+
+  // a trajetória fica acima dos pluviômetros
+  function raiseTrajectory() {
+    if (!state.layer) return;
+    state.layer.eachLayer((l) => {
+      if (typeof l.bringToFront === 'function') l.bringToFront();
+    });
+  }
+
+  function clearGaugeLayer() {
+    if (state.gaugeLayer) {
+      try {
+        if (state.map) state.map.removeLayer(state.gaugeLayer);
+      } catch (err) {
+        console.error(LOG, err);
+      }
+      state.gaugeLayer = null;
+    }
+  }
+
+  function updateGaugeLayer() {
+    clearGaugeLayer();
+    if (state.destroyed || !settings.showGauges || !state.gauges.length || !PAGE.L) return;
+    const map = ensureMap();
+    if (!map) return;
+    try {
+      const L = PAGE.L;
+      const now = Date.now();
+      const layer = L.layerGroup();
+      state.gauges.forEach((g) => {
+        const wet = g.mm1h > 0;
+        const vals = ['1h: ' + num(g.mm1h, 1) + ' mm'];
+        if (g.mm15 != null) vals.push('15min: ' + num(g.mm15, 1) + ' mm');
+        if (g.mm24h != null) vals.push('24h: ' + num(g.mm24h, 1) + ' mm');
+        const lines = [esc(g.name) + ' — ' + esc(g.source) + (g.city ? ', ' + esc(g.city) : ''), vals.map(esc).join(' · ')];
+        if (g.radar1h != null) lines.push('radar 1h: ' + esc(num(g.radar1h, 1)) + ' mm');
+        lines.push(esc(fmtClock(g.t)) + ' (há ' + Math.max(0, Math.round((now - g.t) / 60000)) + ' min)');
+        L.circleMarker([g.lat, g.lon], { radius: wet ? 5 : 3, color: '#ffffff', weight: 1, fillColor: wet ? colorForRate(g.mm1h) : '#9aa4b2', fillOpacity: 0.9 })
+          .bindTooltip(lines.join('<br>'))
+          .addTo(layer);
+      });
+      layer.addTo(map);
+      state.gaugeLayer = layer;
+      raiseTrajectory();
     } catch (err) {
       console.error(LOG, err);
     }
@@ -1295,6 +1808,10 @@
 #rp2-root .rp2-info.rp2-open{display:block}
 #rp2-root .rp2-chart svg{width:100%;height:auto;display:block;background:rgba(255,255,255,.04);border-radius:10px}
 #rp2-root .rp2-chart text{fill:#cbd5e1;font-size:8px}
+#rp2-root .rp2-gauges{margin:8px 0 0}
+#rp2-root .rp2-sec-t{font-size:10px;text-transform:uppercase;letter-spacing:.04em;opacity:.65;margin-bottom:2px}
+#rp2-root .rp2-g{font-size:11px;line-height:1.35;margin:2px 0}
+#rp2-root .rp2-muted{font-size:11px;opacity:.6;margin-top:3px}
 #rp2-root .rp2-radar{font-size:11px;opacity:.8;margin:8px 0 6px}
 #rp2-root .rp2-radar.rp2-stale{color:#ffd166;opacity:1}
 #rp2-root .rp2-actions{display:flex;flex-wrap:wrap;gap:6px}
@@ -1338,13 +1855,15 @@
       '<div class="rp2-status" id="rp2-status"></div>' +
       '<div class="rp2-metrics" id="rp2-metrics"></div>' +
       '<div class="rp2-infohead"><button class="rp2-info-btn" data-act="info" title="Como é calculado" aria-label="Como é calculado">ⓘ</button><span>Como é calculado</span></div>' +
-      '<div class="rp2-info" id="rp2-info">Estimativa feita extrapolando o movimento dos ecos do radar, sem modelo físico. A chuva (mm/h) vem da relação Z = 200·R^1,6 (Marshall–Palmer); o produto MAXDISPLAY tende a superestimar a intensidade. A confiabilidade cai bastante depois de ~60 min.</div>' +
+      '<div class="rp2-info" id="rp2-info">Estimativa feita extrapolando o movimento dos ecos do radar, sem modelo físico. A chuva (mm/h) vem da relação Z = 200·R^1,6 (Marshall–Palmer); o produto MAXDISPLAY tende a superestimar a intensidade. A confiabilidade cai bastante depois de ~60 min. Quando há chuva suficiente, a taxa é calibrada com pluviômetros públicos (soma de 1 h do radar contra a medida).</div>' +
       '<div class="rp2-chart" id="rp2-chart"></div>' +
+      '<div class="rp2-gauges" id="rp2-gauges"></div>' +
       '<div class="rp2-radar" id="rp2-radar"></div>' +
       '<div class="rp2-actions">' +
       '<button class="rp2-btn rp2-primary" data-act="refresh" id="rp2-refresh">🔄 Atualizar</button>' +
       '<button class="rp2-btn" data-act="alerts" id="rp2-alerts" aria-pressed="false">🔔 Alertas</button>' +
       '<button class="rp2-btn" data-act="overlay" id="rp2-overlay" aria-pressed="false">🗺️ Mostrar no mapa</button>' +
+      '<button class="rp2-btn" data-act="gauges" id="rp2-gaugebtn" aria-pressed="false" title="Mostrar pluviômetros no mapa">📍 Pluviômetros</button>' +
       '<button class="rp2-btn" data-act="settings" id="rp2-settingsbtn" title="Configurações" aria-label="Configurações">⚙️</button>' +
       '</div>' +
       '<div class="rp2-settings" id="rp2-settings">' +
@@ -1495,6 +2014,12 @@
         saveSettings();
         updateOverlay();
         break;
+      case 'gauges':
+        settings.showGauges = !settings.showGauges;
+        saveSettings();
+        updateGaugeLayer();
+        renderButtons();
+        break;
       case 'settings':
         document.getElementById('rp2-settings').classList.toggle('rp2-open');
         break;
@@ -1534,7 +2059,7 @@
     const D = '--';
     const cell = (label, value, sub) => ({ label, value: value == null ? D : value, sub: sub || '' });
     if (!R) {
-      return [cell('Chegada'), cell('Duração'), cell('Volume'), cell('Pico'), cell('Chance'), cell('Deslocamento'), cell('Tendência'), cell('Confiança')];
+      return [cell('Chegada'), cell('Duração'), cell('Volume'), cell('Pico'), cell('Chance'), cell('Deslocamento'), cell('Tendência'), cell('Confiança'), cell('Calibração')];
     }
     const age = ageMinOf(R, now);
     const clock = (t) => fmtClock(R.originT + t * 60000);
@@ -1556,7 +2081,40 @@
     cells.push(cell('Tendência', R.trend ? cap(R.trend.label) : null, R.trend && R.trend.pct != null ? (R.trend.pct >= 0 ? '+' : '') + R.trend.pct + '% em ' + R.trend.minutes + ' min' : R.trend ? 'chuva nova' : ''));
     const sk = R.skill;
     cells.push(cell('Confiança', R.confidence ? cap(R.confidence) : null, sk ? 'acerto 30 min: ' + Math.round(sk.csiAdv * 100) + '% vs ' + Math.round(sk.csiPers * 100) + '% parado' : ''));
+    const cb = R.calib;
+    if (cb && cb.valid) cells.push(cell('Calibração', 'radar ×' + num(cb.factor, 1), cb.nPairs + ' pluviômetros c/ chuva'));
+    else if (cb && Math.abs(Math.log(cb.factor)) >= 0.05) cells.push(cell('Calibração', 'radar ×' + num(cb.factor, 1), 'residual (pouca chuva agora)'));
+    else if (state.gaugesAt) cells.push(cell('Calibração', 'neutra', 'pouca chuva p/ calibrar'));
+    else cells.push(cell('Calibração'));
     return cells;
+  }
+
+  function renderGauges(now) {
+    const el = document.getElementById('rp2-gauges');
+    if (!el) return;
+    const sts = Object.keys(state.gaugeStatus).map((k) => state.gaugeStatus[k]);
+    if (!sts.length) {
+      el.innerHTML = '<div class="rp2-sec-t">Pluviômetros próximos</div><div class="rp2-muted">Carregando pluviômetros…</div>';
+      return;
+    }
+    const t = state.target;
+    const near = state.gauges
+      .filter((g) => now - g.t <= GAUGE_MAX_AGE_MS)
+      .map((g) => ({ g, d: haversine(t.lat, t.lon, g.lat, g.lon) }))
+      .filter((x) => x.d <= 15)
+      .sort((a, b) => a.d - b.d)
+      .slice(0, 3);
+    const lines = near.length
+      ? near
+          .map((x) => '<div class="rp2-g">' + esc(x.g.name + ' (' + x.g.source + ') · ' + num(x.d, 1) + ' km · ' + num(x.g.mm1h, 1) + ' mm/1h · há ' + Math.max(0, Math.round((now - x.g.t) / 60000)) + ' min') + '</div>')
+          .join('')
+      : '<div class="rp2-g">Nenhum pluviômetro com dado recente a menos de 15 km</div>';
+    const okN = sts.filter((s) => s.ok).length;
+    const errs = sts.filter((s) => !s.ok).map((s) => s.label + ': ' + s.error).join('\n');
+    el.innerHTML =
+      '<div class="rp2-sec-t">Pluviômetros próximos</div>' +
+      lines +
+      '<div class="rp2-muted"' + (errs ? ' title="' + esc(errs) + '"' : '') + '>' + esc('Fontes: ' + okN + '/' + sts.length + ' ok · ' + state.gauges.length + ' pluviômetros') + '</div>';
   }
 
   function chartSvg(R, now) {
@@ -1621,6 +2179,11 @@
       ov.disabled = state.mapFailed;
       ov.title = state.mapFailed ? 'Não foi possível acessar o mapa da página' : 'Mostrar trajetória no mapa';
     }
+    const gb = q('rp2-gaugebtn');
+    if (gb) {
+      gb.classList.toggle('rp2-on', settings.showGauges);
+      gb.setAttribute('aria-pressed', String(settings.showGauges));
+    }
     const rf = q('rp2-refresh');
     if (rf) {
       rf.disabled = state.loading;
@@ -1649,6 +2212,7 @@
       .join('');
 
     document.getElementById('rp2-chart').innerHTML = R ? chartSvg(R, now) : '';
+    renderGauges(now);
 
     const radar = document.getElementById('rp2-radar');
     if (R) {
@@ -1709,9 +2273,33 @@
     render();
     if (changed) {
       updateOverlay();
+      if (!state.gaugeLayer) updateGaugeLayer();
       evaluateAlerts();
       scheduleSkill();
+      scheduleCalib();
     }
+  }
+
+  // quadros extras (até 20) para somar a chuva do radar sobre cada pluviômetro — depois da primeira renderização e sem bloquear
+  function scheduleCalib() {
+    const R = state.result;
+    if (state.destroyed || state.error || !R) return;
+    if (state.calibKey === R.productId) return;
+    state.calibKey = R.productId;
+    runCalibFrames(R.productId);
+  }
+
+  async function runCalibFrames(key) {
+    try {
+      if (state.skillRun) await state.skillRun; // evita decodificar os mesmos quadros em paralelo com a retroprevisão
+      if (state.destroyed || state.calibKey !== key) return;
+      await loadFrames(await fetchProducts(CALIB_FRAMES));
+    } catch (err) {
+      console.error(LOG, 'Quadros de calibração indisponíveis', err);
+      if (state.calibKey === key) state.calibKey = null; // tenta de novo na próxima atualização
+      return;
+    }
+    onCalibInputs();
   }
 
   // verificação de habilidade (retroprevisão 30 min) — roda depois da renderização
@@ -1721,7 +2309,7 @@
     const key = skillKey(R.productId, R.thr);
     if (state.skillKey === key) return;
     state.skillKey = key;
-    runSkill(key);
+    state.skillRun = runSkill(key);
   }
 
   async function runSkill(key) {
@@ -1761,6 +2349,14 @@
   }
 
   // ── Depuração ────────────────────────────────────────────────────
+  const gaugeStatus = () => {
+    const out = {};
+    Object.keys(state.gaugeStatus).forEach((k) => {
+      out[k] = Object.assign({}, state.gaugeStatus[k]);
+    });
+    return out;
+  };
+
   function debug() {
     const R = state.result;
     const d = state.disc;
@@ -1773,6 +2369,8 @@
       medianV: R && R.motion.valid ? { vxCellsMin: R.motion.vx, vyCellsMin: R.motion.vy, speedKmh: R.motion.speedKmh, fromDeg: R.motion.fromDeg, toDeg: R.motion.toDeg } : null,
       skill: state.skill,
       skillPenalty: R ? R.skillPenalty : null,
+      calib: Object.assign({}, state.calib),
+      gaugeStatus: gaugeStatus(),
       aggBest: R ? R.motion.aggBest : null,
       aggZero: R ? R.motion.aggZero : null,
       sigmaKmh: R ? R.sigmaKmMin * 60 : null,
@@ -1883,6 +2481,7 @@
     clearTimeout(state.msgTimer);
     cancelPick();
     clearOverlay();
+    clearGaugeLayer();
     state.cleanups.forEach((fn) => {
       try {
         fn();
@@ -1895,7 +2494,7 @@
       if (el) el.remove();
     });
     updateTitle(null);
-    if (window.__rp2Instance === instance) window.__rp2Instance = null;
+    if (PAGE.__rp2Instance === instance) PAGE.__rp2Instance = null;
   }
 
   const instance = { destroy };
@@ -1939,10 +2538,12 @@
     state.timers.push(setInterval(() => run({}), POLL_MS));
     state.timers.push(setInterval(render, TICK_MS));
     run({ force: true });
+    refreshGauges(); // independente do radar; nunca bloqueia a análise
+    state.timers.push(setInterval(refreshGauges, GAUGE_POLL_MS));
   }
 
-  window.__rp2Instance = instance;
-  window.RainPredictor = {
+  PAGE.__rp2Instance = instance;
+  PAGE.RainPredictor = {
     version: VERSION,
     run: (force) => run({ force: !!force }).then(() => state.result),
     setTarget: (lat, lon, name) => applyPoint(Number(lat), Number(lon), name || 'Local escolhido'),
@@ -1950,6 +2551,9 @@
     debug,
     selfTest,
     hindcast,
+    gauges: () => state.gauges.map((g) => Object.assign({}, g)),
+    calibration: () => state.calib,
+    gaugeStatus,
     settings,
   };
   console.log('🌧️ Preditor de Chuva v2 carregado — RainPredictor.setTarget(lat, lon, "Nome") para mudar o local');

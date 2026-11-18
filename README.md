@@ -12,6 +12,8 @@ Userscript que prevê quando a chuva chega a um ponto escolhido, quanto tempo du
 
 As atualizações são automáticas, via `@updateURL` do cabeçalho do script.
 
+> A partir da v2.2.0 o script lê pluviômetros de outros sites. Na instalação ou na atualização, a extensão pede permissão para acessar esses hosts (`@connect`: `sirene.cbmerj.rj.gov.br`, `websempre.rio.rj.gov.br` e `services8.arcgis.com`). Aceite para ativar os pluviômetros.
+
 > Se você usou a v1, substitua ou apague o script antigo para que os dois não rodem juntos.
 
 ## O que mostra
@@ -24,8 +26,10 @@ As atualizações são automáticas, via `@updateURL` do cabeçalho do script.
 - **Deslocamento**: velocidade e direção.
 - **Tendência**.
 - **Confiança**, com o acerto dos últimos 30 min.
+- **Calibração**: fator aplicado à chuva do radar a partir dos pluviômetros (ex.: `radar ×1,3`) ou "neutra".
 - **Gráfico** de 0–2 h.
-- **Trajetória** desenhada no mapa (marcas a cada 30 min até o horizonte).
+- **Pluviômetros próximos**: os 3 mais próximos (até 15 km) com mm na última hora.
+- **Trajetória** desenhada no mapa (marcas a cada 30 min até o horizonte) e **pluviômetros** de todo o estado (botão `📍 Pluviômetros`).
 
 ## Recursos
 
@@ -42,6 +46,37 @@ As atualizações são automáticas, via `@updateURL` do cabeçalho do script.
   - `RainPredictor.debug()`
   - `RainPredictor.selfTest()`
   - `RainPredictor.hindcast(30)`
+  - `RainPredictor.gauges()`: pluviômetros normalizados, com `radar1h`
+  - `RainPredictor.calibration()`: estado da calibração
+  - `RainPredictor.gaugeStatus()`: situação de cada fonte
+
+## Pluviômetros
+
+Pluviômetros públicos em tempo real, em todo o estado do Rio de Janeiro, aparecem no mapa (círculos coloridos pela intensidade da última hora; passe o mouse para ver os detalhes), servem para calibrar a estimativa do radar e os mais próximos do ponto aparecem no painel.
+
+Fontes (contagens aproximadas):
+
+- Defesa Civil Niterói: 30
+- Defesa Civil RJ: ~80
+- CEMADEN: ~190
+- Alerta Rio: 33
+- INEA: quando estiver online (hoje as estações estão paradas ou offline e são descartadas)
+
+Os dados vêm do serviço de mapa da Defesa Civil RJ (que espelha as redes de Niterói, do estado, do CEMADEN e do INEA) e do Alerta Rio. Como esses servidores não enviam CORS, a leitura passa pela extensão (`GM_xmlhttpRequest`, com `@connect` para os hosts acima). Se a fonte de Niterói falhar, o script usa o serviço ArcGIS da Prefeitura. Leituras com mais de 90 min, estações offline e coordenadas inválidas são descartadas; estações de fontes diferentes a menos de 150 m são unificadas. Atualização a cada 5 min, independente do radar.
+
+Calibração:
+
+- Compara a chuva do radar acumulada em 1 h sobre cada pluviômetro (taxa Marshall–Palmer, média 3×3 células) com o que o pluviômetro mediu.
+- Viés médio do conjunto (soma do pluviômetro ÷ soma do radar, entre 0,25 e 4), suavizado em escala logarítmica e que volta a 1 com meia-vida de 60 min quando não há chuva para calibrar.
+- Correção local no ponto: média ponderada pelo inverso do quadrado da distância dos pluviômetros a até 25 km, puxada para o viés médio quando há poucos.
+
+O fator só escala mm/h, volume e pico; a chance de chuva não muda. Pluviômetros a até 3 km do ponto também geram avisos quando contradizem o radar (por exemplo, chuva medida com o radar sem eco).
+
+Limitações:
+
+- Os pluviômetros têm latência de 10–30 min.
+- Os feeds não são documentados e podem mudar sem aviso.
+- Servem para calibrar e confirmar, não para prever a hora de chegada da chuva.
 
 ## Como funciona
 
@@ -51,6 +86,7 @@ As atualizações são automáticas, via `@updateURL` do cabeçalho do script.
 4. Extrapola de forma semi-Lagrangiana até o ponto, de 5 a 120 min, com uma vizinhança cujo raio cresce com o tempo de antecedência. Resultam probabilidade, taxa média e percentil 90.
 5. Converte Z = 200·R^1,6 (Marshall–Palmer) em mm/h. Classes: < 2,5 fraca; 2,5–10 moderada; 10–50 forte; ≥ 50 muito forte.
 6. Faz um hindcast automático de 30 min (CSI da advecção contra a persistência). Se a extrapolação perde, a confiança cai e a incerteza aumenta.
+7. Calibra as taxas com os pluviômetros: carrega até 20 quadros recentes, soma a chuva do radar em 1 h sobre cada pluviômetro e aplica um fator às taxas da previsão (veja "Pluviômetros").
 
 ## Limitações
 
