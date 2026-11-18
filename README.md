@@ -25,7 +25,7 @@ As atualizações são automáticas, via `@updateURL` do cabeçalho do script.
 - **Tendência**.
 - **Confiança**, com o acerto dos últimos 30 min.
 - **Gráfico** de 0–2 h.
-- **Trajetória** desenhada no mapa (30/60/90/120 min).
+- **Trajetória** desenhada no mapa (marcas a cada 30 min até o horizonte).
 
 ## Recursos
 

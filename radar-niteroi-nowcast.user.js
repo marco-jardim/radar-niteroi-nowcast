@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Preditor de Chuva - Radar Niterói
 // @namespace    https://radar.niteroi.rj.gov.br/
-// @version      2.1.0
+// @version      2.1.1
 // @description  Prevê quando a chuva chega, quanto dura e quanto chove num ponto escolhido, a partir do radar meteorológico de Niterói
 // @author       marco-jardim
 // @homepageURL  https://github.com/marco-jardim/radar-niteroi-nowcast
@@ -19,7 +19,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '2.1.0';
+  const VERSION = '2.1.1';
   const LOG = '[Preditor de Chuva]';
 
   // ── Instância única ──────────────────────────────────────────────
@@ -1069,8 +1069,7 @@
           return [p.lat, p.lon];
         };
         L.polyline([tl, at(R.horizon)], { color: '#ff3366', weight: 2, dashArray: '6 6', opacity: 0.8 }).addTo(layer);
-        [30, 60, 90, 120].forEach((t) => {
-          if (t > R.horizon) return;
+        Array.from({ length: Math.floor(R.horizon / 30) }, (_, i) => (i + 1) * 30).forEach((t) => {
           const pt = at(t);
           const step = R.steps[Math.min(R.steps.length - 1, Math.round(t / STEP))];
           L.circle(pt, { radius: step.rkm * 1000, color: '#ff3366', weight: 1, opacity: 0.4, fillOpacity: 0.03 }).addTo(layer);
